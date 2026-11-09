@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/app"
@@ -54,7 +55,46 @@ var log zerolog.Logger
 
 var tokens map[string]string
 var clouds map[string]*xiaomi.Cloud
+var cloudLoginErrors map[string]cloudLoginError
+var cloudResets map[string]cloudReset
 var cloudsMu sync.Mutex
+
+const (
+	loginRetries       = 1
+	cloudLoginErrorTTL = time.Minute
+	cloudRetryDelay    = time.Minute
+	cloudMaxRetryDelay = 30 * time.Minute
+)
+
+type cloudLoginError struct {
+	err   error
+	until time.Time
+}
+
+type cloudReset struct {
+	time  time.Time
+	delay time.Duration
+}
+
+func login(userID string) (*xiaomi.Cloud, error) {
+	for i := 0; ; i++ {
+		cloud := xiaomi.NewCloud(AppXiaomiHome)
+		err := cloud.LoginWithToken(userID, tokens[userID])
+		if err == nil {
+			return cloud, nil
+		}
+
+		// Only retry transient network errors. A rejected passToken will not heal
+		// by immediately repeating the same request.
+		var netErr *url.Error
+		if i == loginRetries || !errors.As(err, &netErr) {
+			return nil, err
+		}
+
+		log.Debug().Err(err).Msg("xiaomi: login failed, retrying")
+		time.Sleep(time.Second)
+	}
+}
 
 func getCloud(userID string) (*xiaomi.Cloud, error) {
 	cloudsMu.Lock()
@@ -64,10 +104,24 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
 		return cloud, nil
 	}
 
-	cloud := xiaomi.NewCloud(AppXiaomiHome)
-	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
+	if state := cloudLoginErrors[userID]; state.err != nil && time.Now().Before(state.until) {
+		return nil, state.err
+	}
+
+	cloud, err := login(userID)
+	if err != nil {
+		if cloudLoginErrors == nil {
+			cloudLoginErrors = make(map[string]cloudLoginError)
+		}
+		cloudLoginErrors[userID] = cloudLoginError{
+			err:   err,
+			until: time.Now().Add(cloudLoginErrorTTL),
+		}
 		return nil, err
 	}
+
+	delete(cloudLoginErrors, userID)
+
 	if clouds == nil {
 		clouds = map[string]*xiaomi.Cloud{userID: cloud}
 	} else {
@@ -76,11 +130,68 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
 	return cloud, nil
 }
 
+// resetCloud drops the stale session if it is still current. If another
+// goroutine has already replaced it, the caller may immediately retry using
+// that replacement. Repeated 401s from freshly created sessions are
+// exponentially backed off to protect the Xiaomi account endpoint.
+func resetCloud(userID string, stale *xiaomi.Cloud) bool {
+	cloudsMu.Lock()
+	defer cloudsMu.Unlock()
+
+	if clouds[userID] != stale {
+		return true
+	}
+
+	now := time.Now()
+	state := cloudResets[userID]
+
+	if !state.time.IsZero() && now.Sub(state.time) < state.delay {
+		return false
+	}
+
+	if state.time.IsZero() || now.Sub(state.time) >= 2*cloudMaxRetryDelay {
+		state.delay = cloudRetryDelay
+	} else {
+		state.delay *= 2
+		if state.delay < cloudRetryDelay {
+			state.delay = cloudRetryDelay
+		}
+		if state.delay > cloudMaxRetryDelay {
+			state.delay = cloudMaxRetryDelay
+		}
+	}
+
+	state.time = now
+	if cloudResets == nil {
+		cloudResets = make(map[string]cloudReset)
+	}
+	cloudResets[userID] = state
+	delete(clouds, userID)
+	return true
+}
+
 func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
 	cloud, err := getCloud(userID)
 	if err != nil {
 		return nil, err
 	}
+
+	res, err := cloud.Request(GetBaseURL(region), apiURL, params, nil)
+	if err == nil || !errors.Is(err, xiaomi.ErrUnauthorized) {
+		return res, err
+	}
+
+	if !resetCloud(userID, cloud) {
+		return nil, err
+	}
+
+	log.Warn().Msg("xiaomi: cloud session expired, logging in again")
+
+	cloud, err = getCloud(userID)
+	if err != nil {
+		return nil, err
+	}
+
 	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
 }
 
@@ -333,6 +444,10 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
 		} else {
 			tokens[userID] = token
 		}
+		// An explicit login supersedes all cached session/error/backoff state.
+		delete(clouds, userID)
+		delete(cloudLoginErrors, userID)
+		delete(cloudResets, userID)
 		cloudsMu.Unlock()
 
 		err = app.PatchConfig([]string{"xiaomi", userID}, token)

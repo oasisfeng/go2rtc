@@ -22,6 +22,11 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
+// ErrUnauthorized signals that Xiaomi rejected the current cloud session.
+// Callers can use it to refresh the short-lived serviceToken without relying
+// on string matching of an HTTP status.
+var ErrUnauthorized = errors.New("xiaomi: unauthorized")
+
 type Cloud struct {
 	client *http.Client
 
@@ -435,6 +440,9 @@ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]strin
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
+		if res.StatusCode == http.StatusUnauthorized {
+			return nil, fmt.Errorf("%w: %s", ErrUnauthorized, res.Status)
+		}
 		return nil, errors.New(res.Status)
 	}
 
